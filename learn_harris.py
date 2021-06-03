@@ -74,28 +74,44 @@ def corner_layer(input_data, k=0.04, input_is_image=False, debug=False):
     return scores.float()
 
 
+class FocalLoss(nn.modules.loss._WeightedLoss):
+    def __init__(self, weight=None, gamma=2,reduction='mean'):
+        super(FocalLoss, self).__init__(weight,reduction=reduction)
+        self.gamma = gamma
+        self.weight = weight #weight parameter will act as the alpha parameter to balance class weights
+
+    def forward(self, input, target):
+
+        ce_loss = F.cross_entropy(input, target,reduction=self.reduction,weight=self.weight)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
+        return focal_loss
 
 
 
-def main(path, lr=0.001, save_path='harris.ckpt', batch_size=32, viz_batch_size=8, height=128, width=128, epochs=10, num_workers=2, device='cuda:0', resume=True):
+
+
+def main(path, lr=0.001, save_path='harris.ckpt', batch_size=32, viz_batch_size=8, height=128, width=128, epochs=10, hidden=16, num_workers=2, device='cuda:0', resume=True):
     dataset = torchvision.datasets.ImageFolder(path, loader=lambda path:loader(path, width, height))
     dataloader = torch.utils.data.DataLoader(dataset, batch_size, num_workers=num_workers)
 
+    hidden=16
     net = nn.Sequential(
-            nn.Conv2d(1,8,3,1,1),
-            BasicBlock(8,8,1, norm_layer=nn.BatchNorm2d),
-            BasicBlock(8,8,1, norm_layer=nn.BatchNorm2d),
-            nn.Conv2d(8,1,3,1,1)
+            nn.Conv2d(1,hidden,3,1,1),
+            BasicBlock(hidden,hidden,1, norm_layer=nn.BatchNorm2d),
+            BasicBlock(hidden,hidden,1, norm_layer=nn.BatchNorm2d),
+            nn.Conv2d(hidden,4,3,1,1)
             )
-
-    if os.path.exists(save_path) and resume:
-        net.load_state_dict(torch.load(save_path))
 
     #net = nn.Conv2d(1,2,3,1,1)
     net.to(device)
 
+    if os.path.exists(save_path) and resume:
+        net.load_state_dict(torch.load(save_path))
+
     optim = torch.optim.AdamW(net.parameters(), lr)
 
+    criterion = FocalLoss(gamma=2.0)
 
     for epoch in range(epochs):
         with tqdm.tqdm(dataloader, total=len(dataloader)) as tq:
@@ -107,8 +123,6 @@ def main(path, lr=0.001, save_path='harris.ckpt', batch_size=32, viz_batch_size=
 
                 gradients = kornia.filters.spatial_gradient(x, 'sobel').squeeze(1)
                 t = corner_layer(gradients)
-
-                bin_mask = (t > 6e-5)
 
                 optim.zero_grad()
                 # experiment 1: we train sobel & apply harris response
@@ -123,13 +137,26 @@ def main(path, lr=0.001, save_path='harris.ckpt', batch_size=32, viz_batch_size=
 
 
                 # experiment 2: learn binary mask directly
-                target = bin_mask.squeeze().long()
+                # bin_mask = (t > 6e-5)
+                # target = bin_mask.squeeze().long()
+                # logits = net(x)
+                # loss = kornia.losses.binary_focal_loss_with_logits(logits, target, alpha=0.5, gamma=2.0, reduction='mean')
+                # y = torch.sigmoid(logits)
+
+                # experiment 3: learn quantization
+                tsq = t.squeeze()
+                target = torch.zeros((len(t),height,width), dtype=torch.long, device=device)
+                target[tsq>6e-5]=1
+                target[tsq>6e-4]=2
+                target[tsq>6e-3]=3
+
                 logits = net(x)
-                # loss = kornia.losses.focal_loss(logits, target, alpha=0.5, gamma=2.0, reduction='mean')
-                loss = kornia.losses.binary_focal_loss_with_logits(logits, target, alpha=0.5, gamma=2.0, reduction='mean')
+                loss = criterion(logits, target)
 
-                y = torch.sigmoid(logits)
-
+                #predict
+                y = F.softmax(logits, dim=1)
+                y = y[:,1]*6e-5 + y[:,2]*6e-4 + y[:,3]*6e-3
+                y = y.unsqueeze(1)
 
                 loss.backward()
                 optim.step()
